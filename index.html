@@ -28,12 +28,6 @@
     background:black;
     display:block;
   }
-
-  /* Try to hide native controls (best-effort) */
-  video::-webkit-media-controls { display:none !important; }
-  video::-webkit-media-controls-enclosure { display:none !important; }
-  video { outline: none !important; pointer-events: none !important; }
-
   #status {
     position:fixed;
     left:12px;
@@ -73,38 +67,13 @@
   const status = msg => { const s = document.getElementById('status'); s.textContent = msg; console.log('[player]', msg); };
   const showError = msg => { const e = document.getElementById('error'); e.textContent = msg; e.style.display = 'block'; console.error('[player]', msg); };
 
-  // --- AUTO-ADD mode=mse if missing in hash (safe pre-processing) ---
-  // We modify only the hash string when necessary so parsing below stays the same.
-  (function autoAddModeIfMissing() {
-    try {
-      const rawHash = decodeURIComponent(location.hash.slice(1) || '');
-      if (!rawHash) return;
-      // case 1: full stream.html URL without mode
-      if ((rawHash.startsWith('http://') || rawHash.startsWith('https://')) && rawHash.includes('stream.html') && !rawHash.includes('mode=')) {
-        const sep = rawHash.includes('?') ? '&' : '?';
-        const newHash = rawHash + sep + 'mode=mse';
-        // update hash without reloading (replaceState) to preserve flow
-        history.replaceState(null, '', location.pathname + location.search + '#' + encodeURIComponent(newHash));
-      } else if (rawHash.includes('src=') && !rawHash.includes('mode=')) {
-        // case 2: hash like "src=cam14&..." or "src=cam14" without mode
-        const params = new URLSearchParams(rawHash);
-        params.set('mode','mse');
-        const newHash = params.toString();
-        history.replaceState(null, '', location.pathname + location.search + '#' + encodeURIComponent(newHash));
-      }
-      // if hash is direct wss://, we don't change it
-    } catch (e) {
-      console.warn('autoAddModeIfMissing failed', e);
-    }
-  })();
-
   // Try to import pairs of module scripts (video-stream + video-rtc)
   async function importPairs(pairs){
     for(const pair of pairs){
       try {
         for(const u of pair) {
           if (!u) continue;
-          // dynamic import (module)
+          // dynamic import
           await import(u);
         }
         status('Loaded player scripts');
@@ -120,6 +89,7 @@
   // Prioritize local files (./js/...), then repo absolute (github pages), then origin server, then alexxit fallback.
   const pairs = [
     ['./js/video-stream.js','./js/video-rtc.js'],
+    // if you hosted in gh-pages under same repo root
     [location.origin + location.pathname.replace(/\/[^/]*$/, '/') + 'js/video-stream.js', location.origin + location.pathname.replace(/\/[^/]*$/, '/') + 'js/video-rtc.js'],
     ['https://kertrtc.etnvps.click/video-stream.js','https://kertrtc.etnvps.click/video-rtc.js'],
     ['https://alexxit.github.io/go2rtc/video-stream.js'] // single fallback (video-rtc maybe unnecessary)
@@ -133,7 +103,7 @@
     return;
   }
 
-  // Parse hash (same logic as original)
+  // Parse hash
   const raw = decodeURIComponent(location.hash.slice(1) || '');
   if (!raw) {
     status('Masukkan URL stream di hash (#). Contoh: #https://kertrtc.etnvps.click/stream.html?src=cam14&mode=mse');
@@ -258,8 +228,7 @@
     // recommended attributes to improve autoplay success
     vid.setAttribute('playsinline',''); // ios
     vid.setAttribute('autoplay','');
-    // NOTE: do NOT force muted here — user requested audio allowed if available
-    // vid.setAttribute('muted',''); // REMOVED to keep audio enabled
+    vid.setAttribute('muted',''); // muted increases autoplay success
     vid.background = true;        // keep background
     try { vid.mode = mode; } catch(e) { /* some builds accept attribute only */ }
     try { vid.src = srcToUse; } catch(e) {
@@ -270,32 +239,9 @@
     // center style is handled by #wrap flexbox
     wrap.appendChild(vid);
 
-    // attempt to remove any controls inside shadow DOM (best-effort)
-    setTimeout(() => {
-      try {
-        if (vid.shadowRoot) {
-          const innerVid = vid.shadowRoot.querySelector('video');
-          if (innerVid) {
-            innerVid.removeAttribute('controls');
-            // ensure pointer-events still disabled to avoid accidental interactions
-            innerVid.style.pointerEvents = 'none';
-          }
-        } else {
-          // fallback: find any nested <video>
-          const inner = vid.querySelector && vid.querySelector('video');
-          if (inner) {
-            inner.removeAttribute('controls');
-            inner.style.pointerEvents = 'none';
-          }
-        }
-      } catch(e) {
-        // ignore
-      }
-    }, 500);
-
     // hide status when playing
     const hideStatus = () => { document.getElementById('status').style.display = 'none'; };
-    // handle play attempt with muted fallback (we DID NOT force-mute initially)
+    // handle play attempt with muted fallback
     async function tryPlay(el, mutedTried=false) {
       try {
         if (typeof el.play === 'function') {
@@ -307,7 +253,7 @@
           let inner = el.shadowRoot ? el.shadowRoot.querySelector('video') : null;
           if (!inner) inner = el.querySelector('video');
           if (inner) {
-            // don't force-muted unless autoplay blocked
+            inner.muted = inner.muted || true;
             await inner.play();
             hideStatus();
             status('playing (inner)');
@@ -317,23 +263,19 @@
         }
       } catch (err) {
         console.warn('play failed', err);
-        // if autoplay blocked due to audio, try muted fallback once
+        // if autoplay blocked due to audio, try muted
         if (!mutedTried) {
           try {
-            // set muted attr on element and on inner video if possible
             el.setAttribute('muted','');
             if (el.shadowRoot) {
               const inner = el.shadowRoot.querySelector('video');
-              if (inner) inner.muted = true;
-            } else {
-              const inner = el.querySelector && el.querySelector('video');
               if (inner) inner.muted = true;
             }
           } catch(e){}
           // small delay then retry
           setTimeout(()=> tryPlay(el, true), 300);
         } else {
-          status('Autoplay gagal; player ready. Interaksi pengguna diperlukan untuk suara.');
+          status('Autoplay gagal; but player ready. Tekan play manual.');
         }
       }
     }
