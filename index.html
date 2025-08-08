@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>MSE Player (center, autoplay, fullscreen)</title>
+<style>
+  html,body {
+    height:100%;
+    margin:0;
+    background:#000;
+  }
+  /* container center */
+  #wrap {
+    height:100vh;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:black;
+    overflow:hidden;
+  }
+  video-stream {
+    max-width:100%;
+    max-height:100%;
+    width:auto;
+    height:auto;
+    object-fit:contain;
+    background:black;
+    display:block;
+  }
+  #status {
+    position:fixed;
+    left:12px;
+    bottom:12px;
+    padding:8px 10px;
+    background:rgba(0,0,0,0.6);
+    color:#fff;
+    font-family:monospace;
+    font-size:13px;
+    border-radius:6px;
+    z-index:9999;
+    pointer-events:none;
+  }
+  #error {
+    position:fixed;
+    top:12px;
+    left:50%;
+    transform:translateX(-50%);
+    background:#2b2b2b;
+    color:#ffdddd;
+    padding:10px 14px;
+    border-radius:6px;
+    font-family: sans-serif;
+    font-size:14px;
+    z-index:10000;
+    display:none;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"></div>
+<div id="status">init...</div>
+<div id="error" role="alert"></div>
+
+<script type="module">
+(async () => {
+  const status = msg => { const s = document.getElementById('status'); s.textContent = msg; console.log('[player]', msg); };
+  const showError = msg => { const e = document.getElementById('error'); e.textContent = msg; e.style.display = 'block'; console.error('[player]', msg); };
+
+  // Try to import pairs of module scripts (video-stream + video-rtc)
+  async function importPairs(pairs){
+    for(const pair of pairs){
+      try {
+        for(const u of pair) {
+          if (!u) continue;
+          // dynamic import
+          await import(u);
+        }
+        status('Loaded player scripts');
+        return true;
+      } catch(err) {
+        console.warn('Import failed for', pair, err);
+        // continue trying other pairs
+      }
+    }
+    return false;
+  }
+
+  // Prioritize local files (./js/...), then repo absolute (github pages), then origin server, then alexxit fallback.
+  const pairs = [
+    ['./js/video-stream.js','./js/video-rtc.js'],
+    // if you hosted in gh-pages under same repo root
+    [location.origin + location.pathname.replace(/\/[^/]*$/, '/') + 'js/video-stream.js', location.origin + location.pathname.replace(/\/[^/]*$/, '/') + 'js/video-rtc.js'],
+    ['https://kertrtc.etnvps.click/video-stream.js','https://kertrtc.etnvps.click/video-rtc.js'],
+    ['https://alexxit.github.io/go2rtc/video-stream.js'] // single fallback (video-rtc maybe unnecessary)
+  ];
+
+  status('Loading player scripts...');
+  const ok = await importPairs(pairs);
+  if (!ok) {
+    showError('Gagal memuat script player. Pastikan file js ada di ./js/ atau server sumber dapat diakses (CORS/TLS).');
+    status('script load failed');
+    return;
+  }
+
+  // Parse hash
+  const raw = decodeURIComponent(location.hash.slice(1) || '');
+  if (!raw) {
+    status('Masukkan URL stream di hash (#). Contoh: #https://kertrtc.etnvps.click/stream.html?src=cam14&mode=mse');
+    return;
+  }
+
+  // helper: parse stream.html style
+  let streams = [];
+  let modes = [];
+  let baseForApi = null;
+
+  try {
+    if (raw.startsWith('wss://') || raw.startsWith('ws://')) {
+      // direct websocket URL — force mode=mse
+      streams = [raw];
+      modes = ['mse'];
+      status('Detected direct WSS — akan pakai mode=mse');
+    } else if ((raw.startsWith('http://') || raw.startsWith('https://')) && raw.includes('stream.html')) {
+      // full stream.html URL from origin, parse params
+      const u = new URL(raw);
+      baseForApi = u.origin;
+      const params = u.searchParams;
+      streams = params.getAll('src');
+      modes   = params.getAll('mode');
+      if (streams.length === 0) {
+        // maybe src is provided as single param without list
+        if (params.get('src')) streams = [params.get('src')];
+      }
+      if (modes.length === 0) modes = [''];
+      // normalize lengths
+      while (modes.length < streams.length) modes.push(modes[0] || '');
+      while (streams.length < modes.length) streams.push(streams[0] || '');
+      status('Detected stream.html format -> src: ' + streams.join(','));
+    } else if (raw.includes('src=')) {
+      // hash like src=cam14&mode=mse  (no origin) -> need origin base? assume same origin as kertrtc? Try to detect host from earlier examples
+      const params = new URLSearchParams(raw);
+      streams = params.getAll('src');
+      modes   = params.getAll('mode');
+      if (streams.length === 0 && params.get('src')) streams = [params.get('src')];
+      if (modes.length === 0) modes = ['mse']; // default to mse
+      status('Detected query style hash -> src: ' + streams.join(','));
+    } else {
+      // other: maybe a simple path or plain id -> treat as src name and use origin = kertrtc.etnvps.click (best-effort)
+      streams = [raw];
+      modes = ['mse'];
+      baseForApi = 'https://kertrtc.etnvps.click';
+      status('Detected plain src; assuming origin kertrtc.etnvps.click and mode=mse');
+    }
+  } catch (e) {
+    showError('Parsing hash gagal: ' + e.message);
+    return;
+  }
+
+  const wrap = document.getElementById('wrap');
+
+  // optional: function to test wss reachability (quick)
+  async function testWSS(url, timeout = 3000) {
+    return new Promise(resolve => {
+      let done = false;
+      let ws;
+      try {
+        ws = new WebSocket(url);
+      } catch (err) {
+        resolve({ok:false, err});
+        return;
+      }
+      const timer = setTimeout(()=> {
+        if (!done) { done = true; try{ ws.close(); }catch(e){} resolve({ok:false, err: 'timeout'}); }
+      }, timeout);
+      ws.onopen = () => { if (!done) { done = true; clearTimeout(timer); ws.close(); resolve({ok:true}); } };
+      ws.onerror = (ev) => { if (!done) { done = true; clearTimeout(timer); resolve({ok:false, err:'onerror'}); } };
+    });
+  }
+
+  // create video-stream elements for each stream
+  for (let i=0; i<streams.length; i++){
+    let s = streams[i];
+    let mode = modes[i] || '';
+
+    // If s is just a plain id (like "cam14") and we have baseForApi, build api/ws URL
+    let srcToUse = s;
+    if (!(s.startsWith('wss://') || s.startsWith('ws://') || s.startsWith('http://') || s.startsWith('https://'))) {
+      // assume it's just an id
+      if (baseForApi) {
+        srcToUse = baseForApi + '/api/ws?src=' + encodeURIComponent(s);
+      } else {
+        // fallback: try kertrtc origin
+        srcToUse = 'https://kertrtc.etnvps.click/api/ws?src=' + encodeURIComponent(s);
+      }
+      // if final url is wss-compatible? keep as https; video-stream can accept https + api/ws
+    } else if ((s.startsWith('http://') || s.startsWith('https://')) && s.includes('stream.html')) {
+      // rare edge: someone passed entire stream.html as a stream array item; handle above but just to be safe:
+      const u = new URL(s);
+      srcToUse = u.origin + '/api/ws?src=' + encodeURIComponent(u.searchParams.get('src') || '');
+    }
+
+    // If srcToUse uses wss:// but mode empty -> force mse
+    if ((srcToUse.startsWith('wss://') || srcToUse.startsWith('ws://')) && !mode) mode = 'mse';
+    if (!mode) mode = mode || 'mse'; // default safer
+
+    status('Preparing player for: ' + srcToUse + ' (mode=' + mode + ')');
+
+    // quick test for wss reachability and TLS problems (only informative)
+    if (srcToUse.startsWith('wss://') || srcToUse.includes('/api/ws')) {
+      // try create wss test only if full wss url
+      if (srcToUse.startsWith('wss://')) {
+        status('Testing WSS connectivity...');
+        const res = await testWSS(srcToUse).catch(()=>({ok:false}));
+        if (!res.ok) {
+          showError('Tidak bisa terhubung ke WSS: ' + (res.err || 'gagal koneksi') + '. Periksa server, TLS (sertifikat), atau firewall.');
+          status('WSS unreachable');
+          // still continue creating element so user can see error in console/player
+        } else {
+          status('WSS reachable, membuat player...');
+        }
+      }
+    }
+
+    // create element
+    const vid = document.createElement('video-stream');
+
+    // recommended attributes to improve autoplay success
+    vid.setAttribute('playsinline',''); // ios
+    vid.setAttribute('autoplay','');
+    vid.setAttribute('muted',''); // muted increases autoplay success
+    vid.background = true;        // keep background
+    try { vid.mode = mode; } catch(e) { /* some builds accept attribute only */ }
+    try { vid.src = srcToUse; } catch(e) {
+      // fallback assign via attribute
+      vid.setAttribute('src', srcToUse);
+    }
+
+    // center style is handled by #wrap flexbox
+    wrap.appendChild(vid);
+
+    // hide status when playing
+    const hideStatus = () => { document.getElementById('status').style.display = 'none'; };
+    // handle play attempt with muted fallback
+    async function tryPlay(el, mutedTried=false) {
+      try {
+        if (typeof el.play === 'function') {
+          await el.play();
+          hideStatus();
+          status('playing');
+        } else {
+          // if custom element doesn't proxy play(), try to access internal video
+          let inner = el.shadowRoot ? el.shadowRoot.querySelector('video') : null;
+          if (!inner) inner = el.querySelector('video');
+          if (inner) {
+            inner.muted = inner.muted || true;
+            await inner.play();
+            hideStatus();
+            status('playing (inner)');
+          } else {
+            status('Player created; waiting for stream...');
+          }
+        }
+      } catch (err) {
+        console.warn('play failed', err);
+        // if autoplay blocked due to audio, try muted
+        if (!mutedTried) {
+          try {
+            el.setAttribute('muted','');
+            if (el.shadowRoot) {
+              const inner = el.shadowRoot.querySelector('video');
+              if (inner) inner.muted = true;
+            }
+          } catch(e){}
+          // small delay then retry
+          setTimeout(()=> tryPlay(el, true), 300);
+        } else {
+          status('Autoplay gagal; but player ready. Tekan play manual.');
+        }
+      }
+    }
+
+    // listen for playing events to remove status
+    vid.addEventListener('playing', hideStatus);
+    vid.addEventListener('loadeddata', () => { status('data loaded'); });
+    vid.addEventListener('error', (ev) => {
+      console.error('video-stream error event', ev);
+      showError('Player error. Periksa console (F12) untuk detail. Kemungkinan WSS/JS/CORS/TLS.');
+      status('error');
+    });
+
+    // try to play after a short delay to let element initialize
+    setTimeout(()=> tryPlay(vid), 600);
+
+    // optionally request fullscreen (note: browsers may block without interaction)
+    setTimeout(()=> {
+      if (document.fullscreenEnabled) {
+        try { vid.requestFullscreen && vid.requestFullscreen(); } catch(e) { /* ignore */ }
+      }
+    }, 1000);
+  } // end for streams
+
+})();
+</script>
+</body>
+</html>
